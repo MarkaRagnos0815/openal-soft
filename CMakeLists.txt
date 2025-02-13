@@ -100,8 +100,6 @@ include(GNUInstallDirs)
 find_package(PkgConfig)
 find_package(SDL3 QUIET)
 
-add_subdirectory(fmt-11.1.1 EXCLUDE_FROM_ALL)
-
 option(ALSOFT_DLOPEN  "Check for the dlopen API for loading optional libs"  ON)
 
 option(ALSOFT_WERROR  "Treat compile warnings as errors"      OFF)
@@ -145,6 +143,23 @@ if(DEFINED ALSOFT_AMBDEC_PRESETS)
     message(WARNING "ALSOFT_AMBDEC_PRESETS is deprecated. Use ALSOFT_INSTALL_AMBDEC_PRESETS instead")
 endif()
 
+if(MSVC)
+    option(FORCE_STATIC_VCRT "Force /MT for static VC runtimes" OFF)
+    if(FORCE_STATIC_VCRT)
+        foreach(flag_var
+                CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
+                CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO
+                CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
+                CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+            if(${flag_var} MATCHES "/MD")
+                string(REGEX REPLACE "/MD" "/MT" ${flag_var} "${${flag_var}}")
+            endif()
+        endforeach(flag_var)
+    endif()
+endif()
+
+add_subdirectory(fmt-11.1.1 EXCLUDE_FROM_ALL)
+
 
 set(CPP_DEFS ) # C pre-processor, not C++
 set(INC_PATHS )
@@ -163,6 +178,21 @@ if(WIN32)
     option(ALSOFT_BUILD_ROUTER  "Build the router (EXPERIMENTAL; creates OpenAL32.dll and soft_oal.dll)"  OFF)
     if(MINGW)
         option(ALSOFT_BUILD_IMPORT_LIB "Build an import .lib using dlltool (requires sed)" ON)
+    endif()
+
+    if(NOT ALSOFT_UWP)
+        # Some systems may need NTDDI_VERSION defined to NTDDI_VISTA or later
+        check_c_source_compiles("#define INITGUID
+            #include <shlobj.h>
+            #include <knownfolders.h>
+            int main()
+            {
+                SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DONT_UNEXPAND, NULL, NULL);
+                return 0;
+            }" HAVE_SHGETKNOWNFOLDERPATH_NO_NTDDI)
+        if(NOT HAVE_SHGETKNOWNFOLDERPATH_NO_NTDDI)
+            set(CPP_DEFS ${CPP_DEFS} NTDDI_VERSION=NTDDI_VISTA)
+        endif()
     endif()
 elseif(APPLE)
     option(ALSOFT_OSX_FRAMEWORK "Build as macOS framework" OFF)
@@ -248,19 +278,6 @@ if(MSVC)
     endif()
     if(DXSDK_DIR)
         message(STATUS "Using DirectX SDK directory: ${DXSDK_DIR}")
-    endif()
-
-    option(FORCE_STATIC_VCRT "Force /MT for static VC runtimes" OFF)
-    if(FORCE_STATIC_VCRT)
-        foreach(flag_var
-                CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
-                CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO
-                CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
-                CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
-            if(${flag_var} MATCHES "/MD")
-                string(REGEX REPLACE "/MD" "/MT" ${flag_var} "${${flag_var}}")
-            endif()
-        endforeach(flag_var)
     endif()
 else()
     set(C_FLAGS ${C_FLAGS} -Winline -Wunused -Wall -Wextra -Wshadow -Wconversion -Wcast-align
@@ -1316,9 +1333,9 @@ if(ALSOFT_UTILS)
 endif()
 if(ALSOFT_UTILS OR ALSOFT_EXAMPLES)
     find_package(SndFile)
-    if(SDL3_FOUND)
-        find_package(FFmpeg COMPONENTS AVFORMAT AVCODEC AVUTIL SWSCALE SWRESAMPLE)
-    endif()
+endif()
+if(ALSOFT_EXAMPLES AND SDL3_FOUND)
+    find_package(FFmpeg COMPONENTS AVFORMAT AVCODEC AVUTIL SWSCALE SWRESAMPLE)
 endif()
 
 if(NOT WIN32)
