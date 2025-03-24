@@ -93,6 +93,7 @@ include(CheckCCompilerFlag)
 include(CheckCXXCompilerFlag)
 include(CheckCSourceCompiles)
 include(CheckCXXSourceCompiles)
+include(CheckLinkerFlag)
 include(CheckStructHasMember)
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
@@ -1319,6 +1320,15 @@ if(ALSOFT_EMBED_HRTF_DATA)
     endmacro()
 
     make_hrtf_header("Default HRTF.mhr" "default_hrtf")
+endif()
+
+# Set a 16KB page size for Android
+if(ANDROID)
+    set(CPP_DEFS ${CPP_DEFS} __BIONIC_NO_PAGE_SIZE_MACRO)
+    check_linker_flag(C "-Wl,-z,max-page-size=16384" HAS_MAX_PAGE_SIZE_16384)
+    if(HAS_MAX_PAGE_SIZE_16384)
+        set(LINKER_FLAGS ${LINKER_FLAGS} "-Wl,-z,max-page-size=16384")
+    endif()
 endif()
 
 

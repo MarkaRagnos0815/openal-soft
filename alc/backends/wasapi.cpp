@@ -545,83 +545,42 @@ struct DeviceEnumHelper final : private IMMNotificationClient {
     }
 #else
     /** ----------------------- IMMNotificationClient ------------ */
-    STDMETHODIMP OnDeviceStateChanged(LPCWSTR /*pwstrDeviceId*/, DWORD /*dwNewState*/) noexcept override { return S_OK; }
-
-    STDMETHODIMP OnDeviceAdded(LPCWSTR pwstrDeviceId) noexcept override
+    STDMETHODIMP OnDeviceStateChanged(LPCWSTR deviceId, DWORD newState) noexcept override
     {
-        ComPtr<IMMDevice> device;
-        HRESULT hr{mEnumerator->GetDevice(pwstrDeviceId, al::out_ptr(device))};
-        if(FAILED(hr))
-        {
-            ERR("Failed to get device: {:#x}", as_unsigned(hr));
-            return S_OK;
-        }
+        TRACE("OnDeviceStateChanged({}, {:#x})", deviceId ? wstr_to_utf8(deviceId)
+            : std::string{"<null>"}, newState);
 
-        ComPtr<IMMEndpoint> endpoint;
-        hr = device->QueryInterface(__uuidof(IMMEndpoint), al::out_ptr(endpoint));
-        if(FAILED(hr))
-        {
-            ERR("Failed to get device endpoint: {:#x}", as_unsigned(hr));
-            return S_OK;
-        }
-
-        EDataFlow flowdir{};
-        hr = endpoint->GetDataFlow(&flowdir);
-        if(FAILED(hr))
-        {
-            ERR("Failed to get endpoint data flow: {:#x}", as_unsigned(hr));
-            return S_OK;
-        }
-
-        auto devlock = DeviceListLock{gDeviceList};
-        auto &list = (flowdir==eRender) ? devlock.getPlaybackList() : devlock.getCaptureList();
-
-        if(AddDevice(device, pwstrDeviceId, list))
-        {
-            const auto devtype = (flowdir==eRender) ? alc::DeviceType::Playback
-                : alc::DeviceType::Capture;
-            const std::string msg{"Device added: "+list.back().name};
-            alc::Event(alc::EventType::DeviceAdded, devtype, msg);
-        }
-
-        return S_OK;
+        if(!(newState&DEVICE_STATE_ACTIVE))
+            return DeviceRemoved(deviceId);
+        return DeviceAdded(deviceId);
     }
 
-    STDMETHODIMP OnDeviceRemoved(LPCWSTR pwstrDeviceId) noexcept override
+    STDMETHODIMP OnDeviceAdded(LPCWSTR deviceId) noexcept override
     {
-        auto devlock = DeviceListLock{gDeviceList};
-        for(auto flowdir : std::array{eRender, eCapture})
-        {
-            auto &list = (flowdir==eRender) ? devlock.getPlaybackList() : devlock.getCaptureList();
-            auto devtype = (flowdir==eRender)?alc::DeviceType::Playback : alc::DeviceType::Capture;
+        TRACE("OnDeviceAdded({})", deviceId ? wstr_to_utf8(deviceId) : std::string{"<null>"});
+        return DeviceAdded(deviceId);
+    }
 
-            /* Find the ID in the list to remove. */
-            auto iter = std::find_if(list.begin(), list.end(),
-                [pwstrDeviceId](const DevMap &entry) noexcept
-                { return pwstrDeviceId == entry.devid; });
-            if(iter == list.end()) continue;
-
-            TRACE("Removing device \"{}\", \"{}\", \"{}\"", iter->name, iter->endpoint_guid,
-                wstr_to_utf8(iter->devid));
-
-            std::string msg{"Device removed: "+std::move(iter->name)};
-            list.erase(iter);
-
-            alc::Event(alc::EventType::DeviceRemoved, devtype, msg);
-        }
-        return S_OK;
+    STDMETHODIMP OnDeviceRemoved(LPCWSTR deviceId) noexcept override
+    {
+        TRACE("OnDeviceRemoved({})", deviceId ? wstr_to_utf8(deviceId) : std::string{"<null>"});
+        return DeviceRemoved(deviceId);
     }
 
     /* NOLINTNEXTLINE(clazy-function-args-by-ref) */
     STDMETHODIMP OnPropertyValueChanged(LPCWSTR /*pwstrDeviceId*/, const PROPERTYKEY /*key*/) noexcept override { return S_OK; }
 
-    STDMETHODIMP OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDefaultDeviceId) noexcept override
+    STDMETHODIMP OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR defaultDeviceId) noexcept override
     {
+        TRACE("OnDefaultDeviceChanged({}, {}, {})", al::to_underlying(flow),
+            al::to_underlying(role), defaultDeviceId ? wstr_to_utf8(defaultDeviceId)
+            : std::string{"<null>"});
+
         if(role != eMultimedia)
             return S_OK;
 
-        const std::wstring_view devid{pwstrDefaultDeviceId ? pwstrDefaultDeviceId
-            : std::wstring_view{}};
+        const auto devid = defaultDeviceId ? std::wstring_view{defaultDeviceId}
+            : std::wstring_view{};
         if(flow == eRender)
         {
             DeviceListLock{gDeviceList}.setPlaybackDefaultId(devid);
@@ -757,6 +716,80 @@ private:
     }
 
 #if !ALSOFT_UWP
+    STDMETHODIMP DeviceAdded(LPCWSTR deviceId) noexcept
+    {
+        auto device = ComPtr<IMMDevice>{};
+        auto hr = mEnumerator->GetDevice(deviceId, al::out_ptr(device));
+        if(FAILED(hr))
+        {
+            ERR("Failed to get device: {:#x}", as_unsigned(hr));
+            return S_OK;
+        }
+
+        auto state = DWORD{};
+        hr = device->GetState(&state);
+        if(FAILED(hr))
+        {
+            ERR("Failed to get device state: {:#x}", as_unsigned(hr));
+            return S_OK;
+        }
+        if(!(state&DEVICE_STATE_ACTIVE))
+            return S_OK;
+
+        auto endpoint = ComPtr<IMMEndpoint>{};
+        hr = device->QueryInterface(__uuidof(IMMEndpoint), al::out_ptr(endpoint));
+        if(FAILED(hr))
+        {
+            ERR("Failed to get device endpoint: {:#x}", as_unsigned(hr));
+            return S_OK;
+        }
+
+        auto flowdir = EDataFlow{};
+        hr = endpoint->GetDataFlow(&flowdir);
+        if(FAILED(hr))
+        {
+            ERR("Failed to get endpoint data flow: {:#x}", as_unsigned(hr));
+            return S_OK;
+        }
+
+        auto devlock = DeviceListLock{gDeviceList};
+        auto &list = (flowdir == eRender) ? devlock.getPlaybackList() : devlock.getCaptureList();
+
+        if(AddDevice(device, deviceId, list))
+        {
+            const auto devtype = (flowdir == eRender) ? alc::DeviceType::Playback
+                : alc::DeviceType::Capture;
+            const auto msg = "Device added: "+list.back().name;
+            alc::Event(alc::EventType::DeviceAdded, devtype, msg);
+        }
+
+        return S_OK;
+    }
+
+    STDMETHODIMP DeviceRemoved(LPCWSTR deviceId) noexcept
+    {
+        auto devlock = DeviceListLock{gDeviceList};
+        for(auto flowdir : std::array{eRender, eCapture})
+        {
+            auto &list = (flowdir==eRender) ? devlock.getPlaybackList() : devlock.getCaptureList();
+            auto devtype = (flowdir==eRender)?alc::DeviceType::Playback : alc::DeviceType::Capture;
+
+            /* Find the ID in the list to remove. */
+            auto iter = std::find_if(list.begin(), list.end(),
+                [deviceId](const DevMap &entry) noexcept { return deviceId == entry.devid; });
+            if(iter == list.end()) continue;
+
+            TRACE("Removing device \"{}\", \"{}\", \"{}\"", iter->name, iter->endpoint_guid,
+                wstr_to_utf8(iter->devid));
+
+            std::string msg{"Device removed: "+std::move(iter->name)};
+            list.erase(iter);
+
+            alc::Event(alc::EventType::DeviceRemoved, devtype, msg);
+        }
+        return S_OK;
+    }
+
     ComPtr<IMMDeviceEnumerator> mEnumerator{nullptr};
 
 #else
@@ -1399,9 +1432,8 @@ FORCE_ALIGN void WasapiPlayback::mixerProc(SpatialDevice &audio)
                     auto id = decltype(flags){1} << al::countr_zero(flags);
                     flags &= ~id;
 
-                    channels.emplace_back();
                     audio.mRender->ActivateSpatialAudioObject(static_cast<AudioObjectType>(id),
-                        al::out_ptr(channels.back()));
+                        al::out_ptr(channels.emplace_back()));
                 }
                 buffers.resize(channels.size());
                 if(mResampler)
@@ -1645,7 +1677,7 @@ auto WasapiPlayback::openProxy(const std::string_view name, DeviceHelper &helper
 
     if(HRESULT hr{helper.openDevice(devid, eRender, mmdev)}; FAILED(hr))
     {
-        WARN("Failed to open device \"{}\": {}", devname.empty()
+        WARN("Failed to open device \"{}\": {:#x}", devname.empty()
             ? "(default)"sv : std::string_view{devname}, as_unsigned(hr));
         return hr;
     }
@@ -2674,8 +2706,8 @@ auto WasapiCapture::openProxy(const std::string_view name, DeviceHelper &helper,
     auto hr = helper.openDevice(devid, eCapture, mmdev);
     if(FAILED(hr))
     {
-        WARN("Failed to open device \"{}\"", devname.empty()
-            ? "(default)"sv : std::string_view{devname});
+        WARN("Failed to open device \"{}\": {:#x}", devname.empty()
+            ? "(default)"sv : std::string_view{devname}, as_unsigned(hr));
         return hr;
     }
     if(!devname.empty())
