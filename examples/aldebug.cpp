@@ -29,6 +29,7 @@
 #include <cassert>
 #include <cstdio>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
@@ -112,7 +113,7 @@ auto alGetPointerEXT = LPALGETPOINTEREXT{};
 auto alGetPointervEXT = LPALGETPOINTERVEXT{};
 
 
-int main(std::span<std::string_view> args)
+auto main(std::span<std::string_view> args) -> int
 {
     /* Print out usage if -h was specified */
     if(args.size() > 1 && (args[1] == "-h" || args[1] == "--help"))
@@ -148,6 +149,7 @@ int main(std::span<std::string_view> args)
 
     /* Load the Debug API functions we're using. */
 #define LOAD_PROC(N) N = reinterpret_cast<decltype(N)>(alcGetProcAddress(device.get(), #N))
+    /* NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast) */
     LOAD_PROC(alDebugMessageCallbackEXT);
     LOAD_PROC(alDebugMessageInsertEXT);
     LOAD_PROC(alDebugMessageControlEXT);
@@ -158,6 +160,7 @@ int main(std::span<std::string_view> args)
     LOAD_PROC(alGetObjectLabelEXT);
     LOAD_PROC(alGetPointerEXT);
     LOAD_PROC(alGetPointervEXT);
+    /* NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast) */
 #undef LOAD_PROC
 
     /* Create a debug context and set it as current. If -nodebug was specified,
@@ -271,7 +274,7 @@ int main(std::span<std::string_view> args)
      * through the callback.
      */
     fmt::println("Calling alGetInteger(AL_DOPPLER_VELOCITY)...");
-    auto dv [[maybe_unused]] = alGetInteger(AL_DOPPLER_VELOCITY);
+    std::ignore = alGetInteger(AL_DOPPLER_VELOCITY);
     fmt::println("");
 
     /* These functions are notoriously unreliable for their behavior, they will
@@ -306,6 +309,6 @@ int main(int argc, char **argv)
 {
     assert(argc >= 0);
     auto args = std::vector<std::string_view>(static_cast<unsigned int>(argc));
-    std::copy_n(argv, args.size(), args.begin());
+    std::ranges::copy(std::views::counted(argv, argc), args.begin());
     return main(std::span{args});
 }

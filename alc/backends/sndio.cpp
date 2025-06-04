@@ -232,14 +232,6 @@ bool SndioPlayback::reset()
     mDevice->mBufferSize = par.bufsz + par.round;
 
     mBuffer.resize(size_t{mDevice->mUpdateSize} * par.pchan*par.bps);
-    if(par.sig == 1)
-        std::fill(mBuffer.begin(), mBuffer.end(), std::byte{});
-    else if(par.bits == 8)
-        std::fill_n(mBuffer.data(), mBuffer.size(), std::byte(0x80));
-    else if(par.bits == 16)
-        std::fill_n(reinterpret_cast<uint16_t*>(mBuffer.data()), mBuffer.size()/2, 0x8000);
-    else if(par.bits == 32)
-        std::fill_n(reinterpret_cast<uint32_t*>(mBuffer.data()), mBuffer.size()/4, 0x80000000u);
 
     return true;
 }
@@ -285,12 +277,12 @@ struct SndioCapture final : public BackendBase {
     void open(std::string_view name) override;
     void start() override;
     void stop() override;
-    void captureSamples(std::byte *buffer, uint samples) override;
+    void captureSamples(std::span<std::byte> outbuffer) override;
     uint availableSamples() override;
 
     sio_hdl *mSndHandle{nullptr};
 
-    RingBufferPtr mRing;
+    RingBufferPtr<std::byte> mRing;
 
     std::atomic<bool> mKillNow{true};
     std::thread mThread;
@@ -348,11 +340,10 @@ int SndioCapture::recordProc()
         if(!(revents&POLLIN))
             continue;
 
-        auto data = mRing->getWriteVector();
-        auto buffer = std::span{data[0].buf, data[0].len*frameSize};
+        auto buffer = mRing->getWriteVector()[0];
         while(!buffer.empty())
         {
-            size_t got{sio_read(mSndHandle, buffer.data(), buffer.size())};
+            auto got = sio_read(mSndHandle, buffer.data(), buffer.size());
             if(got == 0)
                 break;
             if(got > buffer.size())
@@ -365,10 +356,7 @@ int SndioCapture::recordProc()
             mRing->writeAdvance(got / frameSize);
             buffer = buffer.subspan(got);
             if(buffer.empty())
-            {
-                data = mRing->getWriteVector();
-                buffer = {data[0].buf, data[0].len*frameSize};
-            }
+                buffer = mRing->getWriteVector()[0];
         }
         if(buffer.empty())
         {
@@ -461,7 +449,7 @@ void SndioCapture::open(std::string_view name)
             DevFmtTypeString(mDevice->FmtType), DevFmtChannelsString(mDevice->FmtChans),
             mDevice->mSampleRate, par.sig?'s':'u', par.bps*8, par.rchan, par.rate};
 
-    mRing = RingBuffer::Create(mDevice->mBufferSize, size_t{par.bps}*par.rchan, false);
+    mRing = RingBuffer<std::byte>::Create(mDevice->mBufferSize, size_t{par.bps}*par.rchan, false);
     mDevice->mBufferSize = static_cast<uint>(mRing->writeSpace());
     mDevice->mUpdateSize = par.round;
 
@@ -496,8 +484,8 @@ void SndioCapture::stop()
         ERR("Error stopping device");
 }
 
-void SndioCapture::captureSamples(std::byte *buffer, uint samples)
-{ std::ignore = mRing->read(buffer, samples); }
+void SndioCapture::captureSamples(std::span<std::byte> outbuffer)
+{ std::ignore = mRing->read(outbuffer); }
 
 uint SndioCapture::availableSamples()
 { return static_cast<uint>(mRing->readSpace()); }

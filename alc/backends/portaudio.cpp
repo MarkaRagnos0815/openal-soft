@@ -301,13 +301,13 @@ struct PortCapture final : public BackendBase {
     void open(std::string_view name) override;
     void start() override;
     void stop() override;
-    void captureSamples(std::byte *buffer, uint samples) override;
+    void captureSamples(std::span<std::byte> outbuffer) override;
     uint availableSamples() override;
 
     PaStream *mStream{nullptr};
     PaStreamParameters mParams{};
 
-    RingBufferPtr mRing{nullptr};
+    RingBufferPtr<std::byte> mRing;
 };
 
 PortCapture::~PortCapture()
@@ -322,7 +322,8 @@ PortCapture::~PortCapture()
 int PortCapture::readCallback(const void *inputBuffer, void*, unsigned long framesPerBuffer,
     const PaStreamCallbackTimeInfo*, const PaStreamCallbackFlags) const noexcept
 {
-    std::ignore = mRing->write(inputBuffer, framesPerBuffer);
+    std::ignore = mRing->write(std::span{static_cast<const std::byte*>(inputBuffer),
+        framesPerBuffer*mRing->getElemSize()});
     return 0;
 }
 
@@ -343,19 +344,18 @@ void PortCapture::open(std::string_view name)
     }
     else
     {
-        auto iter = std::find_if(DeviceNames.cbegin(), DeviceNames.cend(),
-            [name](const DeviceEntry &entry)
-            { return entry.mCaptureChannels > 0 && name == entry.mName; });
-        if(iter == DeviceNames.cend())
+        auto iter = std::ranges::find_if(DeviceNames, [name](const DeviceEntry &entry)
+        { return entry.mCaptureChannels > 0 && name == entry.mName; });
+        if(iter == DeviceNames.end())
             throw al::backend_exception{al::backend_error::NoDevice,
                 "Device name \"{}\" not found", name};
-        deviceid = static_cast<int>(std::distance(DeviceNames.cbegin(), iter));
+        deviceid = static_cast<int>(std::distance(DeviceNames.begin(), iter));
     }
 
     const uint samples{std::max(mDevice->mBufferSize, mDevice->mSampleRate/10u)};
     const uint frame_size{mDevice->frameSizeFromFmt()};
 
-    mRing = RingBuffer::Create(samples, frame_size, false);
+    mRing = RingBuffer<std::byte>::Create(samples, frame_size, false);
 
     mParams.device = deviceid;
     mParams.suggestedLatency = 0.0f;
@@ -419,8 +419,8 @@ void PortCapture::stop()
 uint PortCapture::availableSamples()
 { return static_cast<uint>(mRing->readSpace()); }
 
-void PortCapture::captureSamples(std::byte *buffer, uint samples)
-{ std::ignore = mRing->read(buffer, samples); }
+void PortCapture::captureSamples(std::span<std::byte> outbuffer)
+{ std::ignore = mRing->read(outbuffer); }
 
 } // namespace
 
@@ -440,19 +440,29 @@ bool PortBackendFactory::init()
 # define PALIB "libportaudio.so.2"
 #endif
 
-        pa_handle = LoadLib(PALIB);
-        if(!pa_handle)
+        if(auto libresult = LoadLib(PALIB))
+            pa_handle = libresult.value();
+        else
+        {
+            WARN("Failed to load {}: {}", PALIB, libresult.error());
             return false;
+        }
 
-#define LOAD_FUNC(f) do {                                                     \
-    p##f = reinterpret_cast<decltype(p##f)>(GetSymbol(pa_handle, #f));        \
-    if(p##f == nullptr)                                                       \
-    {                                                                         \
-        CloseLib(pa_handle);                                                  \
-        pa_handle = nullptr;                                                  \
-        return false;                                                         \
-    }                                                                         \
-} while(0)
+        static constexpr auto load_func = [](auto *&func, const char *name) -> bool
+        {
+            using func_t = std::remove_reference_t<decltype(func)>;
+            auto funcresult = GetSymbol(pa_handle, name);
+            if(!funcresult)
+            {
+                WARN("Failed to load function {}: {}", name, funcresult.error());
+                return false;
+            }
+            /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) */
+            func = reinterpret_cast<func_t>(funcresult.value());
+            return true;
+        };
+        auto ok = true;
+#define LOAD_FUNC(f) ok &= load_func(p##f, #f)
         LOAD_FUNC(Pa_Initialize);
         LOAD_FUNC(Pa_Terminate);
         LOAD_FUNC(Pa_GetErrorText);
@@ -466,9 +476,14 @@ bool PortBackendFactory::init()
         LOAD_FUNC(Pa_GetDefaultInputDevice);
         LOAD_FUNC(Pa_GetStreamInfo);
 #undef LOAD_FUNC
+        if(!ok)
+        {
+            CloseLib(pa_handle);
+            pa_handle = nullptr;
+            return false;
+        }
 
-        const PaError err{Pa_Initialize()};
-        if(err != paNoError)
+        if(const auto err = Pa_Initialize(); err != paNoError)
         {
             ERR("Pa_Initialize() returned an error: {}", Pa_GetErrorText(err));
             CloseLib(pa_handle);
@@ -476,9 +491,10 @@ bool PortBackendFactory::init()
             return false;
         }
     }
+
 #else
-    const PaError err{Pa_Initialize()};
-    if(err != paNoError)
+
+    if(const auto err = Pa_Initialize(); err != paNoError)
     {
         ERR("Pa_Initialize() returned an error: {}", Pa_GetErrorText(err));
         return false;

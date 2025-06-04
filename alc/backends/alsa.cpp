@@ -899,7 +899,7 @@ struct AlsaCapture final : public BackendBase {
     void open(std::string_view name) override;
     void start() override;
     void stop() override;
-    void captureSamples(std::byte *buffer, uint samples) override;
+    void captureSamples(std::span<std::byte> outbuffer) override;
     uint availableSamples() override;
     ClockLatency getClockLatency() override;
 
@@ -908,7 +908,7 @@ struct AlsaCapture final : public BackendBase {
     std::vector<std::byte> mBuffer;
 
     bool mDoCapture{false};
-    RingBufferPtr mRing{nullptr};
+    RingBufferPtr<std::byte> mRing;
 
     snd_pcm_sframes_t mLastAvail{0};
 };
@@ -1015,7 +1015,8 @@ void AlsaCapture::open(std::string_view name)
     hp = nullptr;
 
     if(needring)
-        mRing = RingBuffer::Create(mDevice->mBufferSize, mDevice->frameSizeFromFmt(), false);
+        mRing = RingBuffer<std::byte>::Create(mDevice->mBufferSize, mDevice->frameSizeFromFmt(),
+            false);
 
     mDeviceName = name;
 }
@@ -1040,52 +1041,51 @@ void AlsaCapture::stop()
      * snd_pcm_drain is unreliable and snd_pcm_drop drops it. Capture what's
      * available now so it'll be available later after the drop.
      */
-    uint avail{availableSamples()};
+    const auto avail = availableSamples();
     if(!mRing && avail > 0)
     {
         /* The ring buffer implicitly captures when checking availability.
          * Direct access needs to explicitly capture it into temp storage.
          */
         auto temp = std::vector<std::byte>(
-            static_cast<size_t>(snd_pcm_frames_to_bytes(mPcmHandle, avail)));
-        captureSamples(temp.data(), avail);
+            as_unsigned(snd_pcm_frames_to_bytes(mPcmHandle, avail)));
+        captureSamples(temp);
         mBuffer = std::move(temp);
     }
-    if(int err{snd_pcm_drop(mPcmHandle)}; err < 0)
+    if(const auto err = snd_pcm_drop(mPcmHandle); err < 0)
         ERR("snd_pcm_drop failed: {}", snd_strerror(err));
     mDoCapture = false;
 }
 
-void AlsaCapture::captureSamples(std::byte *buffer, uint samples)
+void AlsaCapture::captureSamples(std::span<std::byte> outbuffer)
 {
     if(mRing)
     {
-        std::ignore = mRing->read(buffer, samples);
+        std::ignore = mRing->read(outbuffer);
         return;
     }
 
-    const auto outspan = std::span{buffer,
-        static_cast<size_t>(snd_pcm_frames_to_bytes(mPcmHandle, samples))};
-    auto outiter = outspan.begin();
-    mLastAvail -= samples;
-    while(mDevice->Connected.load(std::memory_order_acquire) && samples > 0)
+    const auto bpf = snd_pcm_frames_to_bytes(mPcmHandle, 1);
+    mLastAvail -= std::ssize(outbuffer) / bpf;
+    while(mDevice->Connected.load(std::memory_order_acquire) && !outbuffer.empty())
     {
-        snd_pcm_sframes_t amt{0};
-
         if(!mBuffer.empty())
         {
             /* First get any data stored from the last stop */
-            amt = snd_pcm_bytes_to_frames(mPcmHandle, static_cast<ssize_t>(mBuffer.size()));
-            if(static_cast<snd_pcm_uframes_t>(amt) > samples) amt = samples;
+            std::ranges::copy(mBuffer | std::views::take(outbuffer.size()), outbuffer.begin());
 
-            amt = snd_pcm_frames_to_bytes(mPcmHandle, amt);
-            std::copy_n(mBuffer.begin(), amt, outiter);
-
+            const auto amt = std::min(std::ssize(outbuffer), std::ssize(mBuffer));
             mBuffer.erase(mBuffer.begin(), mBuffer.begin()+amt);
-            amt = snd_pcm_bytes_to_frames(mPcmHandle, amt);
+            outbuffer = outbuffer.subspan(as_unsigned(amt));
+            continue;
         }
-        else if(mDoCapture)
-            amt = snd_pcm_readi(mPcmHandle, std::to_address(outiter), samples);
+
+        auto amt = snd_pcm_sframes_t{0};
+        if(mDoCapture)
+        {
+            amt = std::ssize(outbuffer) / bpf;
+            amt = snd_pcm_readi(mPcmHandle, outbuffer.data(), as_unsigned(amt));
+        }
         if(amt < 0)
         {
             ERR("read error: {}", snd_strerror(static_cast<int>(amt)));
@@ -1101,29 +1101,27 @@ void AlsaCapture::captureSamples(std::byte *buffer, uint samples)
             }
             if(amt < 0)
             {
-                const char *err{snd_strerror(static_cast<int>(amt))};
+                auto *err = snd_strerror(static_cast<int>(amt));
                 ERR("restore error: {}", err);
                 mDevice->handleDisconnect("Capture recovery failure: {}", err);
                 break;
             }
             /* If the amount available is less than what's asked, we lost it
-             * during recovery. So just give silence instead. */
-            if(static_cast<snd_pcm_uframes_t>(amt) < samples)
+             * during recovery. So just give silence instead.
+             */
+            if(amt*bpf < std::ssize(outbuffer))
                 break;
             continue;
         }
-
-        outiter += amt;
-        samples -= static_cast<uint>(amt);
+        outbuffer = outbuffer.subspan(as_unsigned(amt*bpf));
     }
-    if(samples > 0)
-        std::fill_n(outiter, snd_pcm_frames_to_bytes(mPcmHandle, samples),
-            std::byte((mDevice->FmtType == DevFmtUByte) ? 0x80 : 0));
+    if(!outbuffer.empty())
+        std::ranges::fill(outbuffer, std::byte((mDevice->FmtType == DevFmtUByte) ? 0x80 : 0));
 }
 
 uint AlsaCapture::availableSamples()
 {
-    snd_pcm_sframes_t avail{0};
+    auto avail = snd_pcm_sframes_t{0};
     if(mDevice->Connected.load(std::memory_order_acquire) && mDoCapture)
         avail = snd_pcm_avail_update(mPcmHandle);
     if(avail < 0)
@@ -1140,7 +1138,7 @@ uint AlsaCapture::availableSamples()
         }
         if(avail < 0)
         {
-            const char *err{snd_strerror(static_cast<int>(avail))};
+            auto *err = snd_strerror(static_cast<int>(avail));
             ERR("restore error: {}", err);
             mDevice->handleDisconnect("Capture recovery failure: {}", err);
         }
@@ -1149,7 +1147,7 @@ uint AlsaCapture::availableSamples()
     if(!mRing)
     {
         avail = std::max<snd_pcm_sframes_t>(avail, 0);
-        avail += snd_pcm_bytes_to_frames(mPcmHandle, static_cast<ssize_t>(mBuffer.size()));
+        avail += snd_pcm_bytes_to_frames(mPcmHandle, std::ssize(mBuffer));
         mLastAvail = std::max(mLastAvail, avail);
         return static_cast<uint>(mLastAvail);
     }
@@ -1157,10 +1155,11 @@ uint AlsaCapture::availableSamples()
     while(avail > 0)
     {
         auto vec = mRing->getWriteVector();
-        if(vec[0].len == 0) break;
+        if(vec[0].empty()) break;
 
-        snd_pcm_sframes_t amt{std::min(static_cast<snd_pcm_sframes_t>(vec[0].len), avail)};
-        amt = snd_pcm_readi(mPcmHandle, vec[0].buf, static_cast<snd_pcm_uframes_t>(amt));
+        auto amt = snd_pcm_bytes_to_frames(mPcmHandle, std::ssize(vec[0]));
+        amt = std::min(amt, avail);
+        amt = snd_pcm_readi(mPcmHandle, vec[0].data(), static_cast<snd_pcm_uframes_t>(amt));
         if(amt < 0)
         {
             ERR("read error: {}", snd_strerror(static_cast<int>(amt)));
@@ -1177,7 +1176,7 @@ uint AlsaCapture::availableSamples()
             }
             if(amt < 0)
             {
-                const char *err{snd_strerror(static_cast<int>(amt))};
+                auto *err = snd_strerror(static_cast<int>(amt));
                 ERR("restore error: {}", err);
                 mDevice->handleDisconnect("Capture recovery failure: {}", err);
                 break;
@@ -1213,29 +1212,38 @@ ClockLatency AlsaCapture::getClockLatency()
 } // namespace
 
 
-bool AlsaBackendFactory::init()
+auto AlsaBackendFactory::init() -> bool
 {
 #if HAVE_DYNLOAD
     if(!alsa_handle)
     {
-        alsa_handle = LoadLib("libasound.so.2");
-        if(!alsa_handle)
+        if(auto libresult = LoadLib("libasound.so.2"))
+            alsa_handle = libresult.value();
+        else
         {
-            WARN("Failed to load {}", "libasound.so.2");
+            WARN("Failed to load {}: {}", "libasound.so.2", libresult.error());
             return false;
         }
 
-        std::string missing_funcs;
-#define LOAD_FUNC(f) do {                                                     \
-    p##f = reinterpret_cast<decltype(p##f)>(GetSymbol(alsa_handle, #f));      \
-    if(p##f == nullptr) missing_funcs += "\n" #f;                             \
-} while(0)
+        static constexpr auto load_func = [](auto *&func, const char *name) -> bool
+        {
+            using func_t = std::remove_reference_t<decltype(func)>;
+            auto funcresult = GetSymbol(alsa_handle, name);
+            if(!funcresult)
+            {
+                WARN("Failed to load function {}: {}", name, funcresult.error());
+                return false;
+            }
+            /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) */
+            func = reinterpret_cast<func_t>(funcresult.value());
+            return true;
+        };
+        auto ok = true;
+#define LOAD_FUNC(f) ok &= load_func(p##f, #f)
         ALSA_FUNCS(LOAD_FUNC);
 #undef LOAD_FUNC
-
-        if(!missing_funcs.empty())
+        if(!ok)
         {
-            WARN("Missing expected functions:{}", missing_funcs);
             CloseLib(alsa_handle);
             alsa_handle = nullptr;
             return false;

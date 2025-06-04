@@ -206,19 +206,19 @@ void ALCcontext::sendDebugMessage(std::unique_lock<std::mutex> &debuglock, Debug
         return;
     }
 
-    DebugGroup &debug = mDebugGroups.back();
+    auto &debug = mDebugGroups.back();
 
-    const uint64_t idfilter{(1_u64 << (DebugSourceBase+al::to_underlying(source)))
+    const auto idfilter = (1_u64 << (DebugSourceBase+al::to_underlying(source)))
         | (1_u64 << (DebugTypeBase+al::to_underlying(type)))
-        | (uint64_t{id} << 32)};
-    auto iditer = std::lower_bound(debug.mIdFilters.cbegin(), debug.mIdFilters.cend(), idfilter);
+        | (uint64_t{id} << 32);
+    const auto iditer = std::ranges::lower_bound(debug.mIdFilters, idfilter);
     if(iditer != debug.mIdFilters.cend() && *iditer == idfilter)
         return;
 
-    const uint filter{(1u << (DebugSourceBase+al::to_underlying(source)))
+    const auto filter = (1u << (DebugSourceBase+al::to_underlying(source)))
         | (1u << (DebugTypeBase+al::to_underlying(type)))
-        | (1u << (DebugSeverityBase+al::to_underlying(severity)))};
-    auto iter = std::lower_bound(debug.mFilters.cbegin(), debug.mFilters.cend(), filter);
+        | (1u << (DebugSeverityBase+al::to_underlying(severity)));
+    const auto iter = std::ranges::lower_bound(debug.mFilters, filter);
     if(iter != debug.mFilters.cend() && *iter == filter)
         return;
 
@@ -252,7 +252,7 @@ FORCE_ALIGN DECL_FUNCEXT2(void, alDebugMessageCallback,EXT, ALDEBUGPROCEXT,callb
 FORCE_ALIGN void AL_APIENTRY alDebugMessageCallbackDirectEXT(ALCcontext *context,
     ALDEBUGPROCEXT callback, void *userParam) noexcept
 {
-    std::lock_guard<std::mutex> debuglock{context->mDebugCbLock};
+    auto debuglock = std::lock_guard{context->mDebugCbLock};
     context->mDebugCb = callback;
     context->mDebugParam = userParam;
 }
@@ -321,7 +321,7 @@ try {
     if(enable != AL_TRUE && enable != AL_FALSE)
         context->throw_error(AL_INVALID_ENUM, "Invalid debug enable {}", enable);
 
-    static constexpr size_t ElemCount{DebugSourceCount + DebugTypeCount + DebugSeverityCount};
+    static constexpr auto ElemCount = DebugSourceCount + DebugTypeCount + DebugSeverityCount;
     static constexpr auto Values = make_array_sequence<uint8_t,ElemCount>();
 
     auto srcIdxs = std::span{Values}.subspan(DebugSourceBase,DebugSourceCount);
@@ -359,7 +359,7 @@ try {
     {
         const auto filterbase = (1u<<srcIdxs[0]) | (1u<<typeIdxs[0]);
 
-        std::ranges::for_each(std::span{ids, static_cast<uint>(count)},
+        std::ranges::for_each(std::views::counted(ids, count),
             [enable,filterbase,&debug](const uint id)
         {
             const auto filter = uint64_t{filterbase} | (uint64_t{id} << 32);
@@ -373,6 +373,9 @@ try {
     }
     else
     {
+        /* C++23 has std::views::cartesian(srcIdxs, typeIdxs, svrIdxs) for a
+         * range that gives all value combinations of the given ranges.
+         */
         std::ranges::for_each(srcIdxs, [enable,typeIdxs,svrIdxs,&debug](const uint srcidx)
         {
             const auto srcfilt = 1u<<srcidx;
@@ -381,7 +384,7 @@ try {
                 const auto srctype = srcfilt | (1u<<typeidx);
                 std::ranges::for_each(svrIdxs, [enable,srctype,&debug](const uint svridx)
                 {
-                    const uint filter = srctype | (1u<<svridx);
+                    const auto filter = srctype | (1u<<svridx);
                     auto iter = std::ranges::lower_bound(debug.mFilters, filter);
                     if(!enable && (iter == debug.mFilters.cend() || *iter != filter))
                         debug.mFilters.insert(iter, filter);
@@ -405,7 +408,7 @@ FORCE_ALIGN void AL_APIENTRY alPushDebugGroupDirectEXT(ALCcontext *context, ALen
 try {
     if(length < 0)
     {
-        size_t newlen{std::strlen(message)};
+        auto newlen = std::strlen(message);
         if(newlen >= MaxDebugMessageLength)
             context->throw_error(AL_INVALID_VALUE, "Debug message too long ({} >= {})", newlen,
                 MaxDebugMessageLength);
@@ -447,7 +450,7 @@ catch(std::exception &e) {
 FORCE_ALIGN DECL_FUNCEXT(void, alPopDebugGroup,EXT)
 FORCE_ALIGN void AL_APIENTRY alPopDebugGroupDirectEXT(ALCcontext *context) noexcept
 try {
-    std::unique_lock<std::mutex> debuglock{context->mDebugCbLock};
+    auto debuglock = std::unique_lock{context->mDebugCbLock};
     if(context->mDebugGroups.size() <= 1)
         context->throw_error(AL_STACK_UNDERFLOW_EXT, "Attempting to pop the default debug group");
 
@@ -492,7 +495,7 @@ try {
             auto counter = 0_uz;
             auto todo = 0u;
             std::ignore = std::ranges::find_if(context->mDebugLog | std::views::take(count),
-                [logSpan,&counter,&todo](const DebugLogEntry &entry)
+                [logSpan,&counter,&todo](const DebugLogEntry &entry) noexcept -> bool
             {
                 const auto tocopy = size_t{entry.mMessage.size() + 1};
                 if(tocopy > logSpan.size()-counter)
@@ -510,39 +513,35 @@ try {
 
     auto logrange = context->mDebugLog | std::views::take(toget);
     if(sources)
-        std::ranges::copy(logrange | std::views::transform(&DebugLogEntry::mSource)
-            | std::views::transform(GetDebugSourceEnum), std::span{sources, toget}.begin());
+        std::ranges::transform(logrange | std::views::transform(&DebugLogEntry::mSource),
+            std::span{sources, toget}.begin(), GetDebugSourceEnum);
     if(types)
-        std::ranges::copy(logrange | std::views::transform(&DebugLogEntry::mType)
-            | std::views::transform(GetDebugTypeEnum), std::span{types, toget}.begin());
+        std::ranges::transform(logrange | std::views::transform(&DebugLogEntry::mType),
+            std::span{types, toget}.begin(), GetDebugTypeEnum);
     if(ids)
-        std::ranges::copy(logrange | std::views::transform(&DebugLogEntry::mId),
-            std::span{ids, toget}.begin());
+        std::ranges::transform(logrange, std::span{ids, toget}.begin(), &DebugLogEntry::mId);
     if(severities)
-        std::ranges::copy(logrange | std::views::transform(&DebugLogEntry::mSeverity)
-            | std::views::transform(GetDebugSeverityEnum), std::span{severities, toget}.begin());
+        std::ranges::transform(logrange | std::views::transform(&DebugLogEntry::mSeverity),
+            std::span{severities, toget}.begin(), GetDebugSeverityEnum);
     if(lengths)
     {
-        static constexpr auto getMessageLength = [](const DebugLogEntry &entry) noexcept
-        { return static_cast<ALsizei>(entry.mMessage.size()+1); };
-        std::ranges::copy(logrange | std::views::transform(getMessageLength),
-            std::span{lengths, toget}.begin());
+        std::ranges::transform(logrange, std::span{lengths, toget}.begin(),
+            [](const DebugLogEntry &entry){return static_cast<ALsizei>(entry.mMessage.size()+1);});
     }
 
     if(logBuf)
     {
         const auto logSpan = std::span{logBuf, static_cast<ALuint>(logBufSize)};
         /* C++23...
-        std::ranges::for_each(logrange | std::views::transform(&DebugLogEntry::mMessage)
+        std::ranges::copy(logrange | std::views::transform(&DebugLogEntry::mMessage)
             | std::views::join_with('\0'), logSpan.begin());
         */
         auto logiter = logSpan.begin();
-        std::ranges::for_each(logrange | std::views::transform(&DebugLogEntry::mMessage),
-            [&logiter](const std::string_view msg)
+        std::ranges::for_each(logrange, [&logiter](const std::string_view msg)
         {
             logiter = std::ranges::copy(msg, logiter).out;
             *(logiter++) = '\0';
-        });
+        }, &DebugLogEntry::mMessage);
     }
 
     /* FIXME: Ugh. Calling erase(begin(), begin()+toget) causes an error since
@@ -609,27 +608,28 @@ try {
     const auto labelOut = std::span{label, label ? static_cast<ALuint>(bufSize) : 0u};
     auto copy_name = [name,length,labelOut](std::unordered_map<ALuint,std::string> &names)
     {
-        std::string_view objname;
-
-        auto iter = names.find(name);
-        if(iter != names.end())
-            objname = iter->second;
+        const auto objname = std::invoke([name,&names]
+        {
+            if(auto iter = names.find(name); iter != names.end())
+                return std::string_view{iter->second};
+            return std::string_view{};
+        });
 
         if(labelOut.empty())
             *length = static_cast<ALsizei>(objname.size());
         else
         {
-            const size_t tocopy{std::min(objname.size(), labelOut.size()-1)};
-            auto oiter = std::copy_n(objname.cbegin(), tocopy, labelOut.begin());
+            const auto namerange = objname | std::views::take(labelOut.size()-1);
+            auto oiter = std::ranges::copy(namerange, labelOut.begin()).out;
             *oiter = '\0';
             if(length)
-                *length = static_cast<ALsizei>(tocopy);
+                *length = static_cast<ALsizei>(namerange.size());
         }
     };
 
     if(identifier == AL_SOURCE_EXT)
     {
-        std::lock_guard srclock{context->mSourceLock};
+        auto srclock = std::lock_guard{context->mSourceLock};
         copy_name(context->mSourceNames);
     }
     else if(identifier == AL_BUFFER)
@@ -652,7 +652,7 @@ try {
     }
     else if(identifier == AL_AUXILIARY_EFFECT_SLOT_EXT)
     {
-        std::lock_guard slotlock{context->mEffectSlotLock};
+        auto slotlock = std::lock_guard{context->mEffectSlotLock};
         copy_name(context->mEffectSlotNames);
     }
     else

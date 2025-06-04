@@ -222,7 +222,7 @@ struct OboeCapture final : public BackendBase, public oboe::AudioStreamCallback 
 
     oboe::ManagedStream mStream;
 
-    RingBufferPtr mRing{nullptr};
+    RingBufferPtr<std::byte> mRing;
 
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream *oboeStream, void *audioData,
         int32_t numFrames) override;
@@ -230,14 +230,15 @@ struct OboeCapture final : public BackendBase, public oboe::AudioStreamCallback 
     void open(std::string_view name) override;
     void start() override;
     void stop() override;
-    void captureSamples(std::byte *buffer, uint samples) override;
+    void captureSamples(std::span<std::byte> outbuffer) override;
     uint availableSamples() override;
 };
 
 oboe::DataCallbackResult OboeCapture::onAudioReady(oboe::AudioStream*, void *audioData,
     int32_t numFrames)
 {
-    std::ignore = mRing->write(audioData, static_cast<uint32_t>(numFrames));
+    std::ignore = mRing->write(std::span{static_cast<const std::byte*>(audioData),
+        static_cast<uint32_t>(numFrames)*mRing->getElemSize()});
     return oboe::DataCallbackResult::Continue;
 }
 
@@ -313,7 +314,8 @@ void OboeCapture::open(std::string_view name)
     TRACE("Got stream with properties:\n{}", oboe::convertToText(mStream.get()));
 
     /* Ensure a minimum ringbuffer size of 100ms. */
-    mRing = RingBuffer::Create(std::max(mDevice->mBufferSize, mDevice->mSampleRate/10u),
+    mRing = RingBuffer<std::byte>::Create(
+        std::max(mDevice->mBufferSize, mDevice->mSampleRate/10u),
         static_cast<uint32_t>(mStream->getBytesPerFrame()), false);
 
     mDeviceName = name;
@@ -337,8 +339,8 @@ void OboeCapture::stop()
 uint OboeCapture::availableSamples()
 { return static_cast<uint>(mRing->readSpace()); }
 
-void OboeCapture::captureSamples(std::byte *buffer, uint samples)
-{ std::ignore = mRing->read(buffer, samples); }
+void OboeCapture::captureSamples(std::span<std::byte> outbuffer)
+{ std::ignore = mRing->read(outbuffer); }
 
 } // namespace
 
