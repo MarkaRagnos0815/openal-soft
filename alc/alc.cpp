@@ -405,9 +405,9 @@ std::recursive_mutex ListLock;
 
 void alc_initconfig()
 {
-    if(auto loglevel = al::getenv("ALSOFT_LOGLEVEL"))
+    if(const auto loglevel = al::getenv("ALSOFT_LOGLEVEL"))
     {
-        long lvl = strtol(loglevel->c_str(), nullptr, 0);
+        const auto lvl = strtol(loglevel->c_str(), nullptr, 0);
         if(lvl >= static_cast<long>(LogLevel::Trace))
             gLogLevel = LogLevel::Trace;
         else if(lvl <= static_cast<long>(LogLevel::Disable))
@@ -1332,6 +1332,10 @@ auto UpdateDeviceParams(al::Device *device, const std::span<const int> attrList)
 
             case ATTRIBUTE_HEX(ALC_CONTEXT_FLAGS_EXT)
                 /* Handled in alcCreateContext */
+                break;
+
+            case ATTRIBUTE(ALC_REFRESH)
+                /* Ignored attribute */
                 break;
 
             case ATTRIBUTE(ALC_SYNC)
